@@ -60,3 +60,89 @@
 - 健康増進法
 - 不当景品類及び不当表示防止法（景表法）
 - 特定商取引法
+
+---
+
+## チェッカー実装
+
+`checker/` に Claude API を使った参照実装が入っています。Embedding を使わず、ルールベース（カテゴリ別ルール＋効能効果範囲を常に投入、NGキーワード逆引きインデックスで関連パターンを取得）でコンテキストを構築し、判定だけを LLM に任せるハイブリッド構成。
+
+### アーキテクチャ
+
+```
+入力テキスト + メタデータ(category, medium, subtype)
+    │
+    ├─ 正規化（NFKC + 装飾文字/伏字/スペース剥がし）
+    │      → 「シ★ミが消える」を「シミが消える」として扱う
+    │
+    ├─ 取得（rule-based / no embeddings）
+    │   ├─ 該当カテゴリのルール（category_rules.jsonl から抽出、全件）
+    │   ├─ 該当カテゴリの効能効果範囲（cosmetic_56 / quasi_drug）
+    │   ├─ NGキーワード逆引き → ヒットしたNGパターン（severity順）
+    │   ├─ 該当カテゴリのOKパターン（参考に投入）
+    │   └─ 該当カテゴリの過去事例
+    │
+    └─ 判定（Claude Sonnet 4.6 デフォルト）
+            ├─ system prompt: キャッシュ
+            ├─ カテゴリ参照ブロック: キャッシュ（カテゴリ毎に再利用）
+            └─ 可変ブロック: 入力ごとに変動
+
+    → JSON: verdict / severity / violated_articles /
+            matched_ng_pattern_ids / rationale / rewrite_suggestion
+```
+
+### セットアップ
+
+```bash
+pip install -r requirements.txt
+export ANTHROPIC_API_KEY=sk-ant-...
+```
+
+### 単発チェック
+
+```python
+from checker import Checker
+
+c = Checker()  # デフォルト: claude-sonnet-4-6
+result = c.check("シミが消える美容液", category="化粧品")
+print(result.verdict)           # "NG"
+print(result.severity)          # "high"
+print(result.violated_articles) # ["薬機法第66条"]
+print(result.rationale)         # "化粧品では『日やけによるシミ、ソバカスを防ぐ』..."
+print(result.rewrite_suggestion)# "日やけによるシミ、ソバカスを防ぐ美容液"
+```
+
+メタデータは人間が与える前提：
+
+| 引数 | 値 |
+|------|------|
+| `category` | `化粧品` / `医薬部外品` / `一般用医薬品` / `医療用医薬品` / `医療機器` / `健康食品` / `美容医療` / `雑貨` 等 |
+| `medium` | `Web` / `SNS` / `TV` / `紙面` / `店頭POP` / `口頭` / `メール・LINE` 等（デフォルト `Web`） |
+| `subtype` | 任意の絞り込みタグ（例: `化粧品 > 美白訴求`） |
+
+### 評価データセットでの一括評価
+
+```bash
+# まず10件だけ試す
+python scripts/evaluate.py --eval-file evaluation/eval_dataset.jsonl --limit 10
+
+# 全件（150件）
+python scripts/evaluate.py --eval-file evaluation/eval_dataset.jsonl
+
+# 境界値・敵対的・外れ値
+python scripts/evaluate.py --eval-file evaluation/boundary_cases.jsonl
+python scripts/evaluate.py --eval-file evaluation/adversarial_cases.jsonl
+python scripts/evaluate.py --eval-file evaluation/edge_cases.jsonl
+
+# モデルを変える（Opus 4.7 で高精度版）
+python scripts/evaluate.py --eval-file evaluation/eval_dataset.jsonl --model claude-opus-4-7
+```
+
+出力: 全体精度、`type` 別精度、3×3混同行列、トークン使用量。詳細結果は `evaluation/results.jsonl` に保存。
+
+### 設計上のポイント
+
+- **Embedding を使わない理由**: 「シミを薄くする」(NG) と「シミを防ぐ」(OK) を埋め込みで弁別するのは困難。短文パターンが多く、`ng_keywords` フィールドへの直接マッチが効率的かつ説明可能。
+- **正規化レイヤー**: 装飾文字（★・◆等）、全角スペース、中黒の挿入を `strip_for_matching` で除去し、検閲回避を検出。
+- **プロンプトキャッシュ**: カテゴリ参照ブロック（~2,500トークン）にキャッシュ breakpoint を置き、同一カテゴリの連続呼び出しでキャッシュヒット。
+- **LLM の役割**: キーワードヒットは「候補」として渡し、文脈判断（GRAY なのか NG なのか、メーキャップ効果が冠されているか等）を LLM に任せる。
